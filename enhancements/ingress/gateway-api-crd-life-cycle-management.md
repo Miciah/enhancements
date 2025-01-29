@@ -98,54 +98,112 @@ _TBD_
 
 ## Proposal
 
-### Life-cycle management
+### CRD Life-cycle management
 
-OpenShift's Ingress Operator monitors for the presence of the Gateway API CRDs
-and uses [Server-Side Apply](https://kubernetes.io/docs/reference/using-api/server-side-apply/) to track ownership using the following logic:
+OpenShift's [Cluster Ingress Operator (CIO)] will manage the _entire_
+life-cycle of the Gateway API CRDs from here onward. The CIO will provide a
+[Validating Admission Policy (VAP)] to block updates from sources other than
+the CIO, and will hold the CRDs at a specific `$CRD_VERSION`. In effect, this
+means that the Gateway API resources will now be treated like core APIs.
 
-- If CRDs are absent, the Ingress Operator installs the appropriate version.
-- If CRDs are present with the Ingress Operator as owner:
-  - If they are at the appropriate version, the operator does nothing.
-  - Else, the operator updates the CRDs to the appropriate version.
-- If CRDs are present with some other owner:
-  - If CRDs are at an unexpected version, the operator signals a degraded state.
-  - Else, _TODO: Do we signal degraded, or what?_
+> **Note**: the `$CRD_VERSION` selected for any OCP release version will be
+> based on a corresponding release of [OpenShift Service Mesh (OSSM)] which is
+> the implementation of Gateway API we will be using for first party Gateway
+> API support on the cluster.
 
-Note that the appropriate version for the CRDs depends on the version of
-OpenShift Service Mesh (OSSM) that the Ingress Operator has pinned in a given
-OpenShift release.  Specifically, the CRDs SHOULD be the version corresponding
-to the version of Istio in that OSSM version; they MUST be of some version that
-is compatible and that we have tested with that version of Istio.  That is, in
-order for some version of the CRDs to be allowed to be accepted, Red Hat MUST
-run the upstream conformance tests and downstream end-to-end tests with the
-specific combination of OSSM version that the operator installs and CRD version
-that is desired to be installed.
+[Cluster Ingress Operator (CIO)]:https://github.com/openshift/cluster-ingress-operator
+[Validating Admission Policy (VAP)]:https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/
+[OpenShift Service Mesh (OSSM)]:https://github.com/openshift-service-mesh
 
-These CRDs are necessary for the Gateway API feature to work at all.  Ideally,
-the Ingress Operator is the only agent that attempts to manage the life-cycle of
-these CRDs (that is, creating, updating, or deleting them).  However, in some
-contingencies, this is not the case:
+#### CRD Deployment
 
-- A cluster-admin can install the CRDs before upgrading to OpenShift 4.19.
-- A layered product or third-party controller could be actively managing them.
+The CIO will now check for the presence of the CRDs on the cluster, for
+which there are two scenarios:
 
-In any scenario in which some agent other than the Ingress Operator has
-installed the CRDs, the Ingress Operator cannot trivially infer the intent and
-potential active use of the existing CRDs.  Overwriting the existing versions
-represents a risk of breaking workload or violating the end-user's expectations.
-Thus the Ingress Operator will only detect and warn about these scenarios.
+1. The CRDs are not present, so we create them
+2. The CRDs are already present, so we need to take over management
 
-The Ingress Operator's warning will take the form of, at a minimum, setting the
-`Degraded` status condition's status to `True` with a descriptive message on the
-ingress clusteroperator.  
+The former is extremely straightforward: the CIO will deploy the VAP (to start
+restricting who can manage the CRDs) and then will simply deploy the version of
+the CRDs that meets the needs of the corresponding version of OSSM.
 
-The Cluster Version Operator has [an alerting rule](https://github.com/openshift/cluster-version-operator/blob/0b3f507632ce4705702fc725614bd22d25d6686c/install/0000_90_cluster-version-operator_02_servicemonitor.yaml#L106-L124) that reports when a
-clusteroperator has `Degraded` status `True`.  However, we might decide to
-implement a more specific alerting rule that provides more details on how to
-reconcile conflicting CRDs.
+The latter situation has more complexities. We'll refer to this process as "CRD
+Succession", and cover it's implications and logic below.
 
-_TBD_: Talk about how we could use Server-Side Apply for CRD updates in upgrades
-from OpenShift 4.19.0.
+#### CRD Succession
+
+Taking over the management of the Gateway API CRDs from a previous entity
+can be turmultuous. Downtime, disruption and/or information loss can occur
+during succession for reasons including (but not limited to):
+
+* we will delete all experimental APIs (`TCPRoute`, `UDPRoute` and `TLSRoute`)
+* we will delete old versions of APIs (e.g. `v1beta2.HTTPRoute`)
+* we will drop all experimental fields (e.g. from `Gateway`, `HTTPRoute`)
+* if the CRDs were version v0.x.x our upgrade to v1.x.x may break in-use fields
+* other actors may be actively managing the CRDs and we will start blocking this
+
+_TBD: think more about the L4 route situation. It's definitely simpler for us
+      if we just remove them, but do we need to provide any additional provisions?
+      talk with PMs about this too.
+
+> **Note**: It is an unfortunate downside of how the Gateway API project in
+> upstream delivers standard and experimental features on top of the same
+> groups and kinds that leads us to need to do this heavier cleanup. We are
+> tracking and supporting [an effort] to separate experimental into its own
+> group in upstream, which we expect to help move towards a better overall
+> experience for users who want experimental Gateway API features going
+> forward.
+
+Given the above: **we simply can not anticipate all of the negative effects**
+succession will have on existing implementations. In order to make succession
+a safe process, we will need **consent from a cluster admin for the platform to
+take over management of any existing Gateway API CRDs**. That admin will be
+responsible for ensuring the safety of existing implementions.
+
+Because we require the consent as described above, we will **employ an Admin
+Gate to request consent**. Using an Admin Gate has advantages:
+
+* it requires a human to make a choice to accept succession of the CRDs, which
+  neatly fills our requirement of receiving consent. It allows us to use the
+  Admin Gate description to provide a very clear message about the implications
+  of accepting the gate.
+* as a required pre-upgrade check, it allows us to ensure that only one mode of
+  Gateway API CRD management can be expected on clusters on 4.19 and beyond.
+  This will provide consistency and reduce complexity for integrations, who can
+  simply rely on the APIs being present and managed by the platform thereafter.
+
+The description of the Admin Gate will read something close to this:
+
+```text
+Starting with 4.19 the OpenShift Container Platform now provides automated
+management of Gateway API resources. This service is provided to enable platform
+level support of Gateway API and also allows third party implementations to
+depend on the presence of the APIs as a service provided by the platform going
+forward.
+
+The implication for you is that all CRDs for the Gateway API project need to be
+transferred to control by the platform in order to complete this upgrade. We
+have detected Gateway API CRDs on this cluster, and you must verify the safety
+of any implementations and users of Gateway API which are currently active on
+the cluster, as we can not do this automatically.
+
+Downtime and information loss can occur if you do not fully prepare existing
+Gateway API implementations before proceeding with the upgrade. The CRDs will
+be upgraded to version $CRD_VERSION, which you will need to ensure running
+implementations can support. Experimental resources such as TCPRoute, UDPRoute
+and TLSRoute will be removed entirely. Older versions (prior to version 1) of
+APIs such as v1beta2.HTTPRoute will be removed. Experimental fields will be
+removed (if present) from any v1 APIs. This is not an exhaustive list of things
+to prepare for. See $DOCUMENTATION_URL for further details.
+```
+
+We will provide accompanying documentation that goes into more details about
+all the situations the user will need to check for.
+
+_TBD: verify with PMs that we do indeed want the admingate solution.
+_TBD: document how this is going to work if you're coming from older versions.
+
+[an effort]:https://github.com/kubernetes-sigs/gateway-api/discussions/3497
 
 ### Dead fields
 
